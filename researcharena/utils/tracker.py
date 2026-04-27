@@ -63,6 +63,8 @@ _SUBSCRIPTION_AGENTS = {"claude", "codex"}
 class TokenUsage:
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
 
     @property
     def total(self) -> int:
@@ -71,6 +73,8 @@ class TokenUsage:
     def __iadd__(self, other: TokenUsage) -> TokenUsage:
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
+        self.cache_creation_tokens += other.cache_creation_tokens
+        self.cache_read_tokens += other.cache_read_tokens
         return self
 
     def to_dict(self) -> dict:
@@ -78,6 +82,8 @@ class TokenUsage:
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "total_tokens": self.total,
+            "cache_creation_tokens": self.cache_creation_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
         }
 
 
@@ -215,6 +221,14 @@ class RunTracker:
         m = re.search(r'[Oo]utput.?tokens[:=]\s*([\d,]+)', tail)
         if m:
             usage.output_tokens = int(m.group(1).replace(',', ''))
+
+        m = re.search(r'[Cc]ache creation tokens[:=]\s*([\d,]+)', tail)
+        if m:
+            usage.cache_creation_tokens = int(m.group(1).replace(',', ''))
+
+        m = re.search(r'[Cc]ache read tokens[:=]\s*([\d,]+)', tail)
+        if m:
+            usage.cache_read_tokens = int(m.group(1).replace(',', ''))
 
         # Fallback: "Total tokens: 12345" without input/output breakdown
         if usage.total == 0:

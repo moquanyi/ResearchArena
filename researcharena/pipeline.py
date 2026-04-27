@@ -40,6 +40,11 @@ from researcharena.utils.tracker import RunTracker, TokenUsage
 
 console = Console()
 
+try:
+    from researcharena.tracking.client import TrackingClient
+except ImportError:
+    TrackingClient = None  # type: ignore
+
 
 class Stage(Enum):
     IDEATION = "ideation"
@@ -163,6 +168,14 @@ class Pipeline:
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
         self.tracker = RunTracker(save_dir=self.base_dir)
+
+        # Optional tracking DB (opt-in via config tracking.enabled)
+        self.tracking: TrackingClient | None = None
+        tracking_cfg = config.get("tracking", {})
+        if TrackingClient and tracking_cfg.get("enabled", False):
+            db = tracking_cfg.get("db") or None
+            self.tracking = TrackingClient(db_path=db)
+            self.tracking.init_run(config)
 
         # Self-review config
         sr_config = config.get("self_review", {})
@@ -394,6 +407,8 @@ class Pipeline:
             model=self.agent_config.get("model"),
             attempt=self.state.idea_attempts,
         )
+        if self.tracking:
+            self.tracking.begin_stage("ideation", attempt=self.state.idea_attempts)
 
         # Collect all feedback (self-review + peer review) into one string
         feedback_parts = []
@@ -431,6 +446,10 @@ class Pipeline:
                 log_files=log_files,
                 failure_category=fail_cat,
             )
+            if self.tracking:
+                self.tracking.end_stage("failure", tokens.input_tokens, tokens.output_tokens,
+                                        details="No valid idea.json produced",
+                                        failure_category=fail_cat)
             self.state.idea_history.append({
                 "idea": {"description": "(no idea produced)"},
                 "failure_stage": "ideation",
@@ -448,6 +467,10 @@ class Pipeline:
             tokens=tokens,
             log_files=log_files,
         )
+        if self.tracking:
+            self.tracking.end_stage("success", tokens.input_tokens, tokens.output_tokens,
+                                    details=desc[:80])
+            self.tracking.log_artifact(workspace / "idea.json", "idea")
 
         # Update idea — only reset counters for fresh ideas, not revisions
         self.state.idea = idea
@@ -503,6 +526,8 @@ class Pipeline:
             model=self.agent_config.get("model"),
             attempt=self.state.experiment_attempts,
         )
+        if self.tracking:
+            self.tracking.begin_stage("experiments", attempt=self.state.experiment_attempts)
 
         _, agent_result = experiments.run(
             agent_type=self.agent_type,
@@ -535,6 +560,9 @@ class Pipeline:
                 log_files=log_files,
                 failure_category=fail_cat,
             )
+            if self.tracking:
+                self.tracking.end_stage("failure", tokens.input_tokens, tokens.output_tokens,
+                                        details="No experiment outputs", failure_category=fail_cat)
             self.state.stage = Stage.EXPERIMENTS  # retry
             return
 
@@ -545,6 +573,12 @@ class Pipeline:
             tokens=tokens,
             log_files=log_files,
         )
+        if self.tracking:
+            self.tracking.end_stage("success", tokens.input_tokens, tokens.output_tokens,
+                                    details="Experiment outputs found")
+            results_p = self.state.workspace / "results.json"
+            if results_p.exists():
+                self.tracking.log_artifact(results_p, "results")
         # Self-review will evaluate the quality of experiment outputs
         if self.self_review_enabled and self.self_review_gates.get("experiment", True):
             self.state.stage = Stage.SELF_REVIEW_EXPERIMENT
@@ -566,6 +600,8 @@ class Pipeline:
             model=self.agent_config.get("model"),
             attempt=self.state.paper_revision_attempts + 1,
         )
+        if self.tracking:
+            self.tracking.begin_stage("paper", attempt=self.state.paper_revision_attempts + 1)
 
         success, agent_result = paper_writing.run(
             agent_type=self.agent_type,
@@ -592,6 +628,9 @@ class Pipeline:
                 log_files=log_files,
                 failure_category=fail_cat,
             )
+            if self.tracking:
+                self.tracking.end_stage("failure", tokens.input_tokens, tokens.output_tokens,
+                                        details="No paper.tex produced", failure_category=fail_cat)
             self.state.paper_revision_attempts += 1
             if self.state.paper_revision_attempts <= self.state.max_paper_revisions:
                 console.print(
@@ -611,6 +650,13 @@ class Pipeline:
             tokens=tokens,
             log_files=log_files,
         )
+        if self.tracking:
+            self.tracking.end_stage("success", tokens.input_tokens, tokens.output_tokens,
+                                    details="revision" if is_revision else "initial draft")
+            for fname, atype in [("paper.tex", "paper"), ("paper.pdf", "paper")]:
+                p = self.state.workspace / fname
+                if p.exists():
+                    self.tracking.log_artifact(p, atype)
         if self.self_review_enabled and self.self_review_gates.get("paper", True):
             self.state.stage = Stage.SELF_REVIEW_PAPER
         else:
@@ -860,6 +906,12 @@ class Pipeline:
         review.save_reviews(result, self.state.workspace)
         self.state.review_result = result
 
+        if self.tracking:
+            self.tracking.log_metric("review_score", result.avg_score, stage="review")
+            reviews_p = self.state.workspace / "reviews.json"
+            if reviews_p.exists():
+                self.tracking.log_artifact(reviews_p, "review")
+
         # Track best
         if result.avg_score > self.state.best.score:
             self.state.best = BestPaper(
@@ -999,6 +1051,13 @@ class Pipeline:
 
     def _build_summary(self, elapsed: float) -> dict:
         best = self.state.best
+        if self.tracking:
+            self.tracking.finish_run(
+                status=self.state.stage.value,
+                best_score=best.score if best.idea else None,
+                decision=self.state.review_result.decision if self.state.review_result else None,
+                wall_time_s=elapsed,
+            )
         return {
             "agent": self.agent_type,
             "agent_model": self.agent_config.get("model"),

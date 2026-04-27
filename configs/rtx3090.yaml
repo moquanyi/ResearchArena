@@ -1,0 +1,106 @@
+# ResearchArena — single NVIDIA GeForce RTX 3090 (24 GB VRAM)
+#
+# Targets the local machine: 1× RTX 3090, 16 CPUs, ~94 GB RAM.
+# Uses local runtime (no Docker) so the host's `claude` binary and
+# credentials are picked up directly.
+#
+# Quick test run:
+#   researcharena run -c configs/rtx3090.yaml --max-ideas 1
+#
+# Full GPU seed:
+#   researcharena run -c configs/rtx3090.yaml \
+#     --seed "efficient fine-tuning methods for large language models"
+
+seed_topic: "efficient fine-tuning methods for large language models"
+seed_platform: "gpu"
+seed_domain: "ml"
+
+# ── Per-platform resource profiles ──
+platforms:
+  gpu:
+    resources:
+      total_gpus: 1
+      gpu_ids: "0"
+      gpu_type: "NVIDIA GeForce RTX 3090"
+      gpu_memory_gb: 24
+      total_cpus: 12          # 16 total — leave 4 for OS/display
+      total_memory_gb: 80     # 94 GB total — leave ~14 GB headroom
+      total_shm_gb: 16        # comfortable for multi-worker DataLoaders
+      concurrent_agents: 1
+    docker_image: "researcharena/agent:latest"
+
+  cpu:
+    resources:
+      total_gpus: 0
+      total_cpus: 12
+      total_memory_gb: 80
+      total_shm_gb: 8
+      concurrent_agents: 1
+    docker_image: "researcharena/agent-cpu:latest"
+
+# ── The agent under test ──
+agent:
+  type: "claude"
+  model: "claude-opus-4-6"
+  runtime: "local"            # run directly on host (no Docker)
+  max_turns: 200
+  ideation_timeout: 3600      # 1 hour — 3090 is ~2× slower than A100
+  paper_timeout: 5400         # 1.5 hours
+  docker_image: "researcharena/agent:latest"
+
+experiment:
+  max_gpu_hours: 6            # conservative for 24 GB VRAM vs 80 GB A100
+  max_experiment_retries_per_idea: 3
+  workspace: "outputs/rtx3090"
+
+paper:
+  template: "neurips"
+  max_revisions: 0            # skip revision rounds to save time
+
+review:
+  accept_threshold: 8
+
+  paperreview:
+    email: "${PAPERREVIEW_EMAIL}"
+    email_password: "${PAPERREVIEW_PASSWORD}"
+    imap_server: "imap.gmail.com"
+    poll_interval: 60
+    max_wait: 3600
+    scoring_timeout: 120
+    scoring_max_turns: 5
+
+  agents:
+    - type: "claude"
+      name: "Claude Code"
+      model: "claude-opus-4-6"
+      review_timeout: 3600
+
+    - type: "codex"
+      name: "Codex"
+      review_timeout: 3600
+
+    - type: "kimi"
+      name: "Kimi Code"
+      review_timeout: 3600
+
+self_review:
+  enabled: true
+  max_retries_per_gate: 4
+  timeout: 900                # 15 min per self-review
+  abandon_threshold: -2       # effectively disable abandon
+  thresholds:
+    idea: 8
+    experiment: 6
+    paper: 8
+  gates:
+    idea: true
+    experiment: true
+    paper: true
+
+pipeline:
+  max_ideas_per_seed: 3
+  max_global_steps: 50
+
+tracking:
+  enabled: true
+  db: ""              # empty = ~/.researcharena/runs.db

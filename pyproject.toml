@@ -11,6 +11,7 @@ dependencies = [
 
 [project.optional-dependencies]
 paperreview = ["playwright>=1.40"]
+tracking = ["plotext>=5.2"]
 dev = ["pytest", "ruff"]
 
 [project.scripts]

@@ -85,6 +85,10 @@ def run(config, seed, agent, model, max_ideas, platform, domain, workspace, resu
         overrides["seed_domain"] = domain
     if workspace:
         overrides.setdefault("experiment", {})["workspace"] = workspace
+    elif seed:
+        # Auto-derive workspace from seed so each seed gets its own directory
+        slug = seed.replace(" ", "_").replace("/", "_").lower()[:60]
+        overrides.setdefault("experiment", {})["workspace"] = f"outputs/runs/{slug}"
 
     if overrides:
         cfg = merge_configs(cfg, overrides)
@@ -316,6 +320,318 @@ def list_seeds(seeds_file, conference, platform):
         for s in cpu_seeds:
             confs = ", ".join(s["conferences"]) if s["conferences"] else "—"
             console.print(f"  - {s['name']}  [dim]({confs})[/]")
+
+
+
+# ── Tracking commands ─────────────────────────────────────────────────────────
+
+def _get_store():
+    from researcharena.tracking.store import TrackingStore
+    return TrackingStore()
+
+
+def _short_id(run_id: str) -> str:
+    return run_id[:8]
+
+
+def _status_icon(status: str) -> str:
+    return {"accepted": "✅", "running": "🟢", "failed": "❌", "rejected": "🔴"}.get(status, "⬜")
+
+
+@main.group()
+def runs():
+    """List and inspect experiment runs."""
+    pass
+
+
+@runs.command("list")
+@click.option("--limit", "-n", default=20, help="Max rows to show")
+@click.option("--agent", default=None, help="Filter by agent type")
+@click.option("--status", default=None, help="Filter by status")
+def runs_list(limit, agent, status):
+    """List recent experiment runs."""
+    store = _get_store()
+    rows = store.list_runs(limit=limit, agent=agent, status=status)
+    if not rows:
+        console.print("[yellow]No runs found. Run `researcharena ingest --all` to import existing outputs.[/]")
+        return
+
+    from rich.table import Table
+    t = Table(title=f"Runs ({len(rows)} shown)")
+    t.add_column("ID")
+    t.add_column("Seed")
+    t.add_column("Agent")
+    t.add_column("Status")
+    t.add_column("Score", justify="right")
+    t.add_column("Time", justify="right")
+    t.add_column("Cost $", justify="right")
+    t.add_column("Started")
+
+    import datetime
+    for r in rows:
+        icon = _status_icon(r["status"])
+        started = datetime.datetime.fromtimestamp(r["started_at"]).strftime("%m-%d %H:%M") if r["started_at"] else "—"
+        t.add_row(
+            _short_id(r["run_id"]),
+            (r["seed"] or "")[:40],
+            r["agent"] or "—",
+            f"{icon} {r['status']}",
+            f"{r['best_score']:.1f}" if r["best_score"] is not None else "—",
+            f"{r['wall_time_s']/60:.1f}m" if r["wall_time_s"] else "—",
+            f"{r['cost_usd']:.3f}" if r["cost_usd"] else "—",
+            started,
+        )
+    console.print(t)
+
+
+@runs.command("show")
+@click.argument("run_id")
+def runs_show(run_id):
+    """Show detailed info for a run."""
+    store = _get_store()
+    run = store.get_run(run_id)
+    if not run:
+        console.print(f"[red]Run not found: {run_id}[/]")
+        return
+
+    from rich.table import Table
+    import datetime
+
+    info = Table(title=f"Run {_short_id(run['run_id'])}")
+    info.add_column("Field"); info.add_column("Value")
+    for k in ("run_id", "seed", "agent", "model", "platform", "status", "workspace", "decision"):
+        info.add_row(k, str(run[k] or "—"))
+    if run["best_score"] is not None:
+        info.add_row("best_score", f"{run['best_score']:.1f}/10")
+    if run["wall_time_s"]:
+        info.add_row("wall_time", f"{run['wall_time_s']/60:.1f} min")
+    console.print(info)
+
+    stages = store.get_stages(run["run_id"])
+    if stages:
+        st = Table(title="Stages")
+        st.add_column("Stage"); st.add_column("Attempt"); st.add_column("Outcome")
+        st.add_column("Time (s)", justify="right"); st.add_column("Tokens", justify="right")
+        st.add_column("Details")
+        for s in stages:
+            st.add_row(
+                s["stage"], str(s["attempt"]), s["outcome"] or "—",
+                f"{s['elapsed_s']:.0f}" if s["elapsed_s"] else "—",
+                str(s["tokens_in"] + s["tokens_out"]),
+                (s["details"] or "")[:60],
+            )
+        console.print(st)
+
+    metrics = store.get_metrics(run["run_id"])
+    if metrics:
+        mt = Table(title="Metrics")
+        mt.add_column("Key"); mt.add_column("Value", justify="right"); mt.add_column("Stage")
+        for m in metrics:
+            mt.add_row(m["key"], f"{m['value']:.3f}", m["stage"] or "—")
+        console.print(mt)
+
+    artifacts = store.get_artifacts(run["run_id"])
+    if artifacts:
+        at = Table(title="Artifacts")
+        at.add_column("Name"); at.add_column("Type"); at.add_column("Size", justify="right")
+        for a in artifacts:
+            at.add_row(a["name"], a["type"], f"{a['size_bytes']:,} B" if a["size_bytes"] else "—")
+        console.print(at)
+
+
+@main.command()
+@click.argument("run_id")
+@click.option("--key", "-k", default=None, help="Filter to specific metric key")
+def metrics(run_id, key):
+    """Plot metric curves for a run."""
+    store = _get_store()
+    run = store.get_run(run_id)
+    if not run:
+        console.print(f"[red]Run not found: {run_id}[/]")
+        return
+
+    keys = [key] if key else store.metric_keys(run["run_id"])
+    if not keys:
+        console.print("[yellow]No metrics recorded for this run.[/]")
+        return
+
+    try:
+        import plotext as plt
+        for k in keys:
+            rows = store.get_metrics(run["run_id"], key=k)
+            if not rows:
+                continue
+            xs = list(range(len(rows)))
+            ys = [r["value"] for r in rows]
+            plt.clf()
+            plt.plot(xs, ys, marker="braille")
+            plt.title(f"{k}  (run {_short_id(run['run_id'])})")
+            plt.xlabel("step"); plt.ylabel(k)
+            plt.show()
+    except ImportError:
+        from rich.table import Table
+        for k in keys:
+            rows = store.get_metrics(run["run_id"], key=k)
+            if not rows:
+                continue
+            t = Table(title=k)
+            t.add_column("Step"); t.add_column("Value", justify="right"); t.add_column("Stage")
+            for r in rows:
+                t.add_row(str(r["step"]), f"{r['value']:.4f}", r["stage"] or "—")
+            console.print(t)
+
+
+@main.command()
+@click.argument("run_id")
+@click.option("--type", "-t", "atype", default=None, help="Filter by type (idea/plan/results/paper/review/log)")
+def artifacts(run_id, atype):
+    """List artifacts for a run."""
+    store = _get_store()
+    run = store.get_run(run_id)
+    if not run:
+        console.print(f"[red]Run not found: {run_id}[/]")
+        return
+
+    rows = store.get_artifacts(run["run_id"], type=atype)
+    if not rows:
+        console.print("[yellow]No artifacts recorded.[/]")
+        return
+
+    from rich.table import Table
+    t = Table(title=f"Artifacts — {_short_id(run['run_id'])}")
+    t.add_column("Name"); t.add_column("Type"); t.add_column("Size", justify="right"); t.add_column("Path")
+    for a in rows:
+        t.add_row(a["name"], a["type"], f"{a['size_bytes']:,} B" if a["size_bytes"] else "—", a["path"])
+    console.print(t)
+
+
+@main.command()
+@click.argument("run_id")
+@click.option("--stage", "-s", default=None, help="Filter events to this stage log filename substring")
+@click.option("--tail", "-n", default=30, help="Last N events to show")
+def logs(run_id, stage, tail):
+    """Stream the event log for a run."""
+    store = _get_store()
+    run = store.get_run(run_id)
+    if not run:
+        console.print(f"[red]Run not found: {run_id}[/]")
+        return
+
+    all_artifacts = store.get_artifacts(run["run_id"], type="log")
+    event_files = [a for a in all_artifacts if a["name"].endswith("_events.jsonl")]
+    if stage:
+        event_files = [a for a in event_files if stage in a["name"]]
+
+    if not event_files:
+        console.print("[yellow]No event log files found.[/]")
+        return
+
+    import datetime
+    for a in event_files:
+        console.print(f"\n[bold]{a['name']}[/]")
+        p = Path(a["path"])
+        if not p.exists():
+            console.print(f"  [red]File not found: {p}[/]")
+            continue
+        lines = p.read_text().splitlines()
+        for line in lines[-tail:]:
+            try:
+                evt = json.loads(line)
+                ts = evt.get("ts", 0)
+                event = evt.get("event", {})
+                etype = event.get("type", "")
+                t = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+                if etype == "assistant":
+                    for block in event.get("message", {}).get("content", []):
+                        if block.get("type") == "text":
+                            console.print(f"  💬 {t} {block['text'][:120]}")
+                        elif block.get("type") == "tool_use":
+                            name = block.get("name", "")
+                            inp = block.get("input", {})
+                            detail = next(iter(inp.values()), "") if inp else ""
+                            console.print(f"  🔧 {t} [cyan]{name}[/] {str(detail)[:100]}")
+            except Exception:
+                pass
+
+
+@main.command()
+@click.argument("run_id_1")
+@click.argument("run_id_2")
+def compare(run_id_1, run_id_2):
+    """Side-by-side comparison of two runs."""
+    store = _get_store()
+    r1 = store.get_run(run_id_1)
+    r2 = store.get_run(run_id_2)
+    if not r1 or not r2:
+        console.print("[red]One or both runs not found.[/]")
+        return
+
+    from rich.table import Table
+    t = Table(title="Comparison")
+    t.add_column("Field")
+    t.add_column(_short_id(r1["run_id"]))
+    t.add_column(_short_id(r2["run_id"]))
+
+    for k in ("seed", "agent", "model", "status", "decision"):
+        t.add_row(k, str(r1[k] or "—"), str(r2[k] or "—"))
+    t.add_row("best_score",
+              f"{r1['best_score']:.1f}" if r1["best_score"] is not None else "—",
+              f"{r2['best_score']:.1f}" if r2["best_score"] is not None else "—")
+    t.add_row("wall_time",
+              f"{r1['wall_time_s']/60:.1f}m" if r1["wall_time_s"] else "—",
+              f"{r2['wall_time_s']/60:.1f}m" if r2["wall_time_s"] else "—")
+    t.add_row("tokens",
+              f"{r1['tokens_in']+r1['tokens_out']:,}",
+              f"{r2['tokens_in']+r2['tokens_out']:,}")
+    t.add_row("cost $",
+              f"{r1['cost_usd']:.3f}" if r1["cost_usd"] else "—",
+              f"{r2['cost_usd']:.3f}" if r2["cost_usd"] else "—")
+    console.print(t)
+
+    # Metric comparison
+    keys1 = set(store.metric_keys(r1["run_id"]))
+    keys2 = set(store.metric_keys(r2["run_id"]))
+    all_keys = sorted(keys1 | keys2)
+    if all_keys:
+        mt = Table(title="Metrics")
+        mt.add_column("Key")
+        mt.add_column(_short_id(r1["run_id"]), justify="right")
+        mt.add_column(_short_id(r2["run_id"]), justify="right")
+        for k in all_keys:
+            def _last(rid):
+                rows = store.get_metrics(rid, key=k)
+                return f"{rows[-1]['value']:.3f}" if rows else "—"
+            mt.add_row(k, _last(r1["run_id"]), _last(r2["run_id"]))
+        console.print(mt)
+
+
+@main.command()
+@click.option("--workspace", "-w", default=None, type=click.Path(exists=True),
+              help="Ingest a specific workspace directory")
+@click.option("--all", "ingest_all", is_flag=True, default=False,
+              help="Scan all of outputs/ and ingest every workspace found")
+@click.option("--outputs-dir", default="outputs", help="Root outputs directory (default: outputs/)")
+def ingest(workspace, ingest_all, outputs_dir):
+    """Import existing run outputs into the tracking database."""
+    from researcharena.tracking.ingest import ingest_workspace as _ingest_one
+    from researcharena.tracking.ingest import ingest_all as _ingest_all
+    from researcharena.tracking.store import TrackingStore
+
+    store = TrackingStore()
+
+    if workspace:
+        rid = _ingest_one(Path(workspace), store)
+        if rid:
+            console.print(f"[green]Ingested: {rid}  ({workspace})[/]")
+        else:
+            console.print(f"[yellow]No idea_XX/ dirs found in {workspace}[/]")
+    elif ingest_all:
+        rids = _ingest_all(Path(outputs_dir), store)
+        console.print(f"[green]Ingested {len(rids)} run(s).[/]")
+        for rid in rids:
+            console.print(f"  {rid}")
+    else:
+        console.print("Specify --workspace PATH or --all")
 
 
 if __name__ == "__main__":

@@ -95,3 +95,7 @@ review:
 pipeline:
   max_ideas_per_seed: 5
   max_global_steps: 30
+
+tracking:
+  enabled: true
+  db: ""              # empty = ~/.researcharena/runs.db

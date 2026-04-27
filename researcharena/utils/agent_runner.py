@@ -388,6 +388,29 @@ def _invoke_docker(
 
 # ── Execution strategies ─────────────────────────────────────────────────
 
+_MAX_EVENT_CONTENT = 100_000  # bytes — truncate tool results larger than this in JSONL
+
+
+def _truncate_large_content(event: dict) -> None:
+    """Truncate large tool result content in-place so JSONL stays manageable.
+
+    Full output is preserved in the _stdout.txt file; the JSONL only needs
+    the structure for metric extraction and stage tracking.
+    """
+    msg = event.get("message", {})
+    if not isinstance(msg, dict):
+        return
+    content = msg.get("content", [])
+    if not isinstance(content, list):
+        return
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "tool_result":
+            raw = item.get("content", "")
+            if isinstance(raw, str) and len(raw) > _MAX_EVENT_CONTENT:
+                item["content"] = raw[:_MAX_EVENT_CONTENT] + f"\n...<truncated {len(raw) - _MAX_EVENT_CONTENT} bytes>"
+
 
 def _run_with_streaming(
     cmd: list[str],
@@ -408,6 +431,10 @@ def _run_with_streaming(
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
     events_path = log_dir / f"{log_prefix}_events.jsonl"
+    _tokens_in = 0
+    _tokens_out = 0
+    _cache_creation = 0
+    _cache_read = 0
 
     try:
         proc = subprocess.Popen(
@@ -467,14 +494,23 @@ def _run_with_streaming(
                         if stripped:
                             try:
                                 event = json.loads(stripped)
+                                _truncate_large_content(event)
+                                usage = event.get("message", {}).get("usage", {})
+                                _tokens_in += usage.get("input_tokens", 0)
+                                _tokens_out += usage.get("output_tokens", 0)
+                                _cache_creation += usage.get("cache_creation_input_tokens", 0)
+                                _cache_read += usage.get("cache_read_input_tokens", 0)
                                 events_file.write(
                                     json.dumps({"ts": ts, "event": event}) + "\n"
                                 )
                             except json.JSONDecodeError:
                                 events_file.write(
-                                    json.dumps({"ts": ts, "line": stripped}) + "\n"
+                                    json.dumps({"ts": ts, "line": stripped[:4096]}) + "\n"
                                 )
-                            events_file.flush()
+                            try:
+                                events_file.flush()
+                            except OSError as exc:
+                                console.print(f"  [yellow]Warning: events flush failed ({exc}), continuing.[/]")
                     else:
                         stderr_lines.append(line)
 
@@ -489,12 +525,18 @@ def _run_with_streaming(
                                 ts = time.time()
                                 try:
                                     event = json.loads(stripped)
+                                    _truncate_large_content(event)
+                                    usage = event.get("message", {}).get("usage", {})
+                                    _tokens_in += usage.get("input_tokens", 0)
+                                    _tokens_out += usage.get("output_tokens", 0)
+                                    _cache_creation += usage.get("cache_creation_input_tokens", 0)
+                                    _cache_read += usage.get("cache_read_input_tokens", 0)
                                     events_file.write(
                                         json.dumps({"ts": ts, "event": event}) + "\n"
                                     )
                                 except json.JSONDecodeError:
                                     events_file.write(
-                                        json.dumps({"ts": ts, "line": stripped}) + "\n"
+                                        json.dumps({"ts": ts, "line": stripped[:4096]}) + "\n"
                                     )
                     if proc.stderr:
                         for line in proc.stderr:
@@ -504,9 +546,15 @@ def _run_with_streaming(
         elapsed = time.time() - start
         console.print(f"  Finished in {elapsed:.0f}s, exit code {proc.returncode}")
 
+        token_summary = (
+            f"\nInput tokens: {_tokens_in}\n"
+            f"Output tokens: {_tokens_out}\n"
+            f"Cache creation tokens: {_cache_creation}\n"
+            f"Cache read tokens: {_cache_read}\n"
+        )
         return _save_and_return(
             exit_code=proc.returncode,
-            stdout="".join(stdout_lines),
+            stdout="".join(stdout_lines) + token_summary,
             stderr="".join(stderr_lines),
             elapsed=elapsed,
             workspace=workspace,
